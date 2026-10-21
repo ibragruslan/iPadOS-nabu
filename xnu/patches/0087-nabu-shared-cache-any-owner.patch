@@ -1,0 +1,27 @@
+--- a/bsd/vm/vm_unix.c
++++ b/bsd/vm/vm_unix.c
+@@ -2492,6 +2492,7 @@
+ 				error));
+ 			goto done;
+ 		}
++#if !defined(ARM64_BOARD_CONFIG_NABU)
+ 		if (va.va_uid != 0) {
+ 			SHARED_REGION_TRACE_ERROR(
+ 				("shared_region: %p [%d(%s)] map(%p:'%s'): "
+@@ -2503,6 +2504,16 @@
+ 			error = EPERM;
+ 			goto done;
+ 		}
++#else
++		/*
++		 * NABU: the iOS root image is produced on a Mac by a normal
++		 * user, so dyld_shared_cache_arm64 is owned by that uid rather
++		 * than root. The ownership test then returned EPERM, the shared
++		 * cache never mapped, and launchd died with
++		 * "Library not loaded: /usr/lib/libSystem.B.dylib".
++		 * Accept any owner on this bring-up board.
++		 */
++#endif /* !ARM64_BOARD_CONFIG_NABU */
+ 
+ #if XNU_TARGET_OS_OSX && defined(__arm64__)
+ after_root_check:

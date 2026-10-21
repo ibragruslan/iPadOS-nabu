@@ -1,0 +1,27 @@
+--- a/bsd/dev/arm/kern_machdep.c
++++ b/bsd/dev/arm/kern_machdep.c
+@@ -92,6 +92,24 @@
+ 			}
+ 			break;
+ 
++#if defined(ARM64_BOARD_CONFIG_NABU)
++		/*
++		 * NABU builds a plain arm64 kernel (no PAC), so cpu_subtype()
++		 * answers CPU_SUBTYPE_ARM64_ALL (0). That matched no case here,
++		 * every arm64 Mach-O graded 0, and process 1 died with
++		 * "exec of /sbin/launchd failed, errno 86" (EBADARCH).
++		 * Grade iOS arm64 binaries exactly as an ARM64_V8 host does.
++		 */
++		case CPU_SUBTYPE_ARM64_ALL:
++			switch (execsubtype) {
++			case CPU_SUBTYPE_ARM64_V8:
++				return 10;
++			case CPU_SUBTYPE_ARM64_ALL:
++				return 9;
++			}
++			break;
++#endif /* ARM64_BOARD_CONFIG_NABU */
++
+ 		case CPU_SUBTYPE_ARM64E:
+ 			switch (execsubtype) {
+ 			case CPU_SUBTYPE_ARM64E:

@@ -1,5 +1,105 @@
 # iOS 16 on nabu (Redmi Note 10 Pro, SM7150) - working notes
 
+## 2026-10-22 - PIVOT to clean ARM64 iPad7,3: launchd + system daemons up
+
+**MILESTONE: clean iPadOS 16.6.1 (20G81) userland is running on nabu HW.**
+launchd (PID 1) is alive and continuously spawning the full system daemon set
+(datamigrator, tccd, assistantd, cloudd, coreduetd, geod, remindd, biomed,
+triald, familycircled, ScreenTimeAgent, siri.embeddedspeech, containermanager,
+amsaccountsd, swcd, ...); AKS selectors 0/7/17/35 answer. Photo confirmed on
+device 2026-10-22. No GUI (SpringBoard/backboardd) seen in that photo yet.
+
+**Why a new base:** moved off the iPhone X (iPhone10,3 / D22AP / iOS 16.7)
+line below to a clean ARM64 IPSW with no ARM64E/PAC:
+`iPad_Pro_HFR_16.6.1_20G81_Restore.ipsw` (iPad Pro 10.5" A10X = iPad7,3).
+
+**Observed on disk / in logs (verified this session):**
+- `xnu/out/kernel.development.nabu` (+ `.orig` backup) rebuilt 2026-10-22 00:3x.
+- `tools/mkadt.py` has a new `--ipad` path: model iPad7,3, target J207/J207AP,
+  `ipad_product()` props, 1668x2224 canvas intent.
+- `shim/out/shim-boot.img` rebuilt 00:53; `shim/out/nabu.adt` 00:46.
+- Rootfs `/Volumes/Work/ios-nabu-root/ipados16-root.simg` = 10.8 GB (built 00:04)
+  from OS rootfs + SystemOS/AppOS cryptexes; flashed to `userdata`.
+- Boot log `logs/crash_reboot.txt`: 6/6 CPUs via PSCI, no EBADARCH panic,
+  `NABU FB: AppleCLCD 1600x2560` (note: presents NATIVE 1600x2560, not the
+  1668x2224 iPad canvas), UFS userdata mounted rw as root.
+
+**Reported by prior-agent handoff (NOT independently re-verified byte-for-byte):**
+- EBADARCH (errno 86) panic fix: `_grade_binary` in
+  `bsd/dev/arm/kern_machdep.c` rejected cpusubtype 0 (PAC-less ARM64 the
+  compiler emitted). Binary-patched at offset `0x946c78` to `mov w0,#10; ret`
+  (`0x52800140 0xd65f03c0`) -> all ARM64 binaries graded OK.
+- dyld shared cache `owned by uid=501 instead of 0`: `shared_region_map_and_
+  slide_2_np` in `bsd/vm/vm_unix.c` rejected va_uid != 0 (image built on Mac
+  as uid 501). Patched offset `0x895d74`: `cbnz w8,...` -> NOP
+  (`0xd503201f`) so the cache maps regardless of UID.
+- ADT via `python3 tools/mkadt.py shim/out/nabu.adt --ipad`; payload via
+  `tools/mkpayload.py`; boot via `fastboot boot shim/out/shim-boot.img`.
+  Full cmdline in the handoff (incl. `rd=ufsroot0 launchd_unsecure_cache=1
+  nabufb_fallback=1 nabufb_stretch=1 nabufb_hz=30 nabutouch=1`).
+
+**DIAGNOSTIC BLOCKER found 2026-10-22 (on a Mac host):** the GUI/daemon
+state cannot currently be captured on this macOS machine.
+- The persistent disk log ring (patch 0047) does exactly ONE flush per boot
+  and freezes: every recovery-pull returns an identical 7708-byte, `flush #1`
+  dump ending at `NABU USB: soft reset done` (USB-net bring-up). Verified
+  across 3 boots incl. a controlled 120 s run. So `tools/nabu-log-pull.sh`
+  only ever shows early boot - useless for backboardd/SpringBoard diagnosis.
+- **ROOT CAUSE FOUND (reading `0047` + `0069` + `0082` sources):** in
+  `nabu_log_thread()` (`bsd/dev/nabu_ufs.c`) a failed flush did
+  `printf("NABU LOG: write failed (%d), stopping"); return;` - the thread
+  EXITED on the very first write error and never flushed again. The error
+  message itself can never reach the disk (it is printed after the failed
+  write), which is why pulls look silently truncated; it SHOULD be visible on
+  the framebuffer console. The likely error source is contention with root
+  I/O over the shared DMA bounce buffer (`su.dma + DMA_BOUNCE`) once launchd
+  mounts the root rw - which is why it always dies right around USB/launchd
+  start. Note `0069` made the flush interval 10 s (`ufslogsecs`), not 1 s.
+- Earlier guess "USB redirects the console to UDP, killing the disk log" was
+  WRONG: `0077`'s `ud_log_thread` only READS the ring via `nabu_log_copy()`
+  and `nabuusblog=0` genuinely disables it. USB is not the bug.
+- `nabuusb=0` did not stop USB-net coming up; not investigated further since
+  USB turned out to be irrelevant to the log freeze.
+- The live USB console (UDP 5140, `tools/nabu-usbnet.sh`) is Linux-only
+  (`ip`/`nmcli`, `cdc_ether`). On this Mac the device does not enumerate as a
+  USB network interface at all (nothing in `system_profiler SPUSBDataType`),
+  so the live path is unavailable here.
+- Recovery itself WORKS: `fastboot boot <TWRP>` then `adb` as root in recovery
+  is fine (the only recovery image on this Mac is
+  `~/Downloads/CN_V4-MODDED-TWRP-WINDOWS-03-05.img`; the TWRP screen is
+  black/frozen - wrong panel driver - but adb is up, which is all the pull
+  needs). Project `recovery/` dir with OrangeFox is NOT present locally.
+- Built `shim/out/shim-boot-nousb.img` (= current kernel/ADT + cmdline with
+  `nabuusb=0 nabuusblog=0`) for the test; kept `shim/out/shim-boot.img` intact.
+**FIX: patches 0085-0087 written 2026-10-22 (apply cleanly, CI not yet run).**
+Source for them came from the CI artifact `xnu-buildtree` of run
+**39633953577** (`gh run download 39633953577 -n xnu-buildtree`), which ships
+the fully patched tree - the right way to write a new patch without a local
+xnu checkout. All three were generated with real `diff -u` against that tree
+and verified with `patch -p1 --dry-run`.
+- **0085-nabu-log-retry-on-write-error**: the log thread no longer returns on
+  a write error; it retries on the next tick and rate-limits the message
+  (`NABU LOG: write failed (%d), retry %u`). This is what should finally give
+  a full-boot disk log and unblock GUI diagnosis.
+- **0086-nabu-grade-plain-arm64-binaries**: adds `case CPU_SUBTYPE_ARM64_ALL`
+  to the hostsubtype switch in `grade_binary()`. Replaces the BINARY patch at
+  offset 0x946c78 described above.
+- **0087-nabu-shared-cache-any-owner**: compiles out the `va.va_uid != 0`
+  shared-cache ownership test. Replaces the BINARY patch at offset 0x895d74.
+- 0086/0087 are MANDATORY for any CI rebuild: without them the freshly built
+  kernel panics with EBADARCH / launchd cannot load libSystem again, because
+  the binary offset patches do not survive a rebuild.
+- `ARM64_BOARD_CONFIG_NABU` is safe to use in any file: `makedefs/MakeInc.def`
+  sets `MACHINE_FLAGS_ARM64_NABU = -DARM64_BOARD_CONFIG_NABU` for the whole
+  build.
+
+**NEXT (frontier on the new base):** get backboardd + SpringBoard up and
+rendering to the 1600x2560 framebuffer (prior base got there; re-derive here).
+To diagnose where SpringBoard is, pull a fresh console log (recovery pull or
+USB net per the workflows below). Open: the two kernel patches are raw binary
+offset patches on the built kernel, not source patches in `xnu/patches/` -
+fold them into source + CI so they survive the next kernel rebuild.
+
 ## 2026-10-21 - iPadOS 16 UI + NT36523 probe
 
 - **Display/UI:** 1600x2560 panel; fallback presents backboardd's 1668x2224
