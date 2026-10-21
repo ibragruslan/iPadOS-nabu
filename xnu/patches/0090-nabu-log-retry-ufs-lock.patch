@@ -1,0 +1,27 @@
+--- a/bsd/dev/nabu_ufs.c
++++ b/bsd/dev/nabu_ufs.c
+@@ -780,7 +780,23 @@
+ 		 * back round. Skip the tick instead and try again later; the ring
+ 		 * holds the bytes until the controller is idle enough.
+ 		 */
+-		if (!lck_mtx_try_lock(&nabu_ufs_lock)) {
++		/*
++		 * One try per tick was not enough: 0089 showed the ring growing
++		 * (total climbed past 43 kB) but still only flush #1 on disk, so
++		 * after userland starts the mutex is essentially never free at
++		 * the instant we look. Individual root requests are only
++		 * milliseconds long though, so keep trying for a short while and
++		 * a gap turns up. Still never block: if 200 ms of tries all fail,
++		 * give up on this tick and keep the bytes in the ring.
++		 */
++		bool locked = false;
++		for (int i = 0; i < 400 && !locked; i++) {
++			locked = lck_mtx_try_lock(&nabu_ufs_lock);
++			if (!locked) {
++				delay(500);
++			}
++		}
++		if (!locked) {
+ 			busy++;
+ 			continue;
+ 		}

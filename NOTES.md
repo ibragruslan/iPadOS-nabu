@@ -128,6 +128,45 @@ but it already contains the 0083 NT36523 probe, so it is from 10-21):**
 - Tail of the ring is the NT36523 touch probe spamming an identical raw
   frame `fc f1 95 2d a0 19 58 12` over and over.
 
+**SOLVED 2026-10-22: why the on-disk console log always died after flush #1.**
+Chain of evidence, each step ruling the previous guess out:
+1. 0085 (retry instead of `return`) changed nothing and printed no `retry`
+   line -> the flush was never hitting the error path at all.
+2. 0088 added a heartbeat at the TOP of the loop (right after the tsleep).
+   Booting it showed the framebuffer console scrolling daemon output
+   normally but **not a single `NABU LOG: tick` line** -> the thread was not
+   coming back round the loop; it was stuck inside the flush body.
+3. `ufs_write_blocks()` cannot hang: every command has a 5 s deadline
+   (`CMD_TIMEOUT_NS`) and returns ETIMEDOUT. `sleepable` needs `ufswait=1`
+   which is off by default, so it just spins with `delay(1)`.
+   => the only unbounded wait left is `lck_mtx_lock(&nabu_ufs_lock)`.
+4. `ufs_strategy()` takes that SAME mutex for every root block request. Once
+   launchd and the daemons start reading the root, the log thread queues
+   behind them and never acquires it. flush #1 only ever succeeded because
+   it ran before userland started.
+**0089** takes the mutex with `lck_mtx_try_lock()` and skips the tick when
+the controller is busy (counted as `busy=` in the heartbeat). Boot-tested
+result: see below / next handoff.
+
+**Device/host gotchas learned 2026-10-22:**
+- Flashing `userdata` does NOT wipe the log ring: the image is ~14 GB and is
+  written at the START of a 37.6 GB partition, while the ring lives in the
+  LAST 4 MiB. That is why stale pre-iPad log data (1125x2436, "SWEET"
+  prefixes) kept showing up and confused the analysis for a while.
+- After a big `fastboot flash userdata`, the Xiaomi ABL wedges: the next
+  `fastboot boot` dies with `usb_write failed ... e00002c0` /
+  `could not clear input pipe`. Do NOT retry - the user must re-enter
+  fastboot by hand (Power+VolDown). (Already in the 10-17 notes; confirmed.)
+- The root image has **3.7 GiB free of 14 GiB**, so free space is NOT a
+  boot/GUI blocker. Growing it to 24 GB is possible but blocked on macOS:
+  the image is a bare HFSX volume with no partition map, so
+  `diskutil resizeVolume` refuses ("a partition, not a whole disk"), and
+  `hdiutil resize -size` grows only the container, not the filesystem. The
+  remaining route is `hdiutil create` a bigger bare volume + `asr restore`,
+  which needs sudo. Left undone deliberately.
+- The external "Work" APFS volume spontaneously unmounts; remount with
+  `diskutil mount disk6s1` before any image work.
+
 **NEXT (frontier on the new base):** get backboardd + SpringBoard up and
 rendering to the 1600x2560 framebuffer (prior base got there; re-derive here).
 To diagnose where SpringBoard is, pull a fresh console log (recovery pull or
