@@ -1,0 +1,44 @@
+--- a/bsd/dev/nabu_ufs.c
++++ b/bsd/dev/nabu_ufs.c
+@@ -741,7 +741,7 @@
+ {
+ 	uint64_t base = su.first_block + su.nblocks - NABU_LOG_BLOCKS;
+ 	uint64_t flushed = 0, seq = 0;
+-	uint32_t failures = 0;
++	uint32_t failures = 0, busy = 0;
+ 	void *bounce = (void *)(su.dma + DMA_BOUNCE);
+ 
+ 	printf("NABU LOG: console log to the last %u KiB of the partition (block 0x%llx)\n",
+@@ -761,15 +761,29 @@
+ 		 *    longer stay stuck at flush #1 while data blocks move on
+ 		 *    (which made nabu-log-pull.sh truncate the whole log).
+ 		 */
+-		printf("NABU LOG: tick total=%llu flushed=%llu seq=%llu\n",
+-		    total, flushed, seq);
++		printf("NABU LOG: tick total=%llu flushed=%llu seq=%llu busy=%u\n",
++		    total, flushed, seq, busy);
+ 		if (total == flushed) {
+ 			continue;
+ 		}
+ 		uint64_t pos = total - flushed >= NABU_LOG_SIZE ? total - NABU_LOG_SIZE : flushed;
+ 		int error = 0;
+ 
+-		lck_mtx_lock(&nabu_ufs_lock);
++		/*
++		 * Never block here. ufs_strategy() takes this same mutex for
++		 * every root block request, so once launchd and the daemons are
++		 * hammering the root filesystem the log thread could queue on it
++		 * indefinitely. That is exactly what happened: flush #1 landed
++		 * before userland started, and from then on the thread sat in
++		 * lck_mtx_lock() forever - no error, no retry from 0085, and the
++		 * 0088 heartbeat never printed again because the loop never came
++		 * back round. Skip the tick instead and try again later; the ring
++		 * holds the bytes until the controller is idle enough.
++		 */
++		if (!lck_mtx_try_lock(&nabu_ufs_lock)) {
++			busy++;
++			continue;
++		}
+ 		while (pos < total && !error) {
+ 			uint32_t off = (uint32_t)(pos % NABU_LOG_SIZE);
+ 			uint32_t blk = off / UFS_BLOCK;
