@@ -1,0 +1,425 @@
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -113,6 +113,7 @@
+ bsd/dev/nabu_rpmh.c			standard
+ bsd/dev/nabu_spmi.c			standard
+ bsd/dev/nabu_usb.c			standard
++bsd/dev/nabu_backlight.c		standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+ bsd/dev/unix_startup.c			standard
+--- a/bsd/dev/nabu_ufs.c
++++ b/bsd/dev/nabu_ufs.c
+@@ -53,6 +53,7 @@
+ extern void nabu_keys_init(void);
+ extern void nabu_touch_init(void);
+ extern void nabu_usb_probe(void);
++extern int nabu_backlight_init(void);
+ 
+ #define REG_CAP         0x00
+ #define REG_IS          0x20
+@@ -660,6 +661,7 @@
+ 	nabu_keys_init();
+ 	nabu_touch_init();
+ 	nabu_usb_probe();
++	nabu_backlight_init();
+ 	return 0;
+ }
+ 
+--- /dev/null
++++ b/bsd/dev/nabu_backlight.c
+@@ -0,0 +1,394 @@
++/*
++ * NABU (Xiaomi Pad 5, SM8150) backlight: Kinetic KTZ8866 on GENI I2C SE0.
++ *
++ * I2C on QUPv3 wrap0 SE0 at 0x00880000, 7-bit slave address 0x11.
++ * SDA = GPIO 0, SCL = GPIO 1 (SOUTH tile 0x03d00000, func 1).
++ * Clocks: SE-RCG GCC 0x17148, SE-CBCR Halt GCC 0x17144, Vote GCC 0x5200c (bit 10).
++ *
++ * KTZ8866 uses 11-bit brightness level (12..2047):
++ *   level = 2047 * pct * pct / 10000;
++ *   REG_BRT_LSB (0x04): bits 0..2
++ *   REG_BRT_MSB (0x05): bits 3..10
++ *
++ * Integrated with:
++ *   - boot-arg backlight=N (1..100%, default 70%)
++ *   - sysctl kern.backlight (RW, 1..100%)
++ *   - NabuFramebuffer RequestPowerChange (display off -> 0, display on -> restore)
++ */
++#if defined(ARM64_BOARD_CONFIG_NABU)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/sysctl.h>
++#include <kern/clock.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++
++int nabu_backlight_init(void);
++int nabu_backlight_set_percent(uint32_t pct);
++int nabu_backlight_get_percent(void);
++int nabu_backlight_set_power(int on);
++
++#define KTZ_ADDR            0x11u
++#define REG_DEVICE_ID       0x01u
++#define REG_BRT_LSB         0x04u
++#define REG_BRT_MSB         0x05u
++#define REG_BL_EN           0x08u
++#define MAX_LEVEL           2047u
++#define MIN_LEVEL           12u
++
++#define GCC_BASE_PA         0x00100000u
++#define GCC_QUP_VOTE        0x5200cu
++#define GCC_QUP0_M_AHB      (1u << 6)
++#define GCC_QUP0_S_AHB      (1u << 7)
++#define GCC_SE0_VOTE        (1u << 10)
++#define GCC_QUP0_M_AHB_HALT 0x17004u
++#define GCC_QUP0_S_AHB_HALT 0x17008u
++#define GCC_SE0_HALT        0x17144u
++#define GCC_SE0_RCG         0x17148u
++
++#define TLMM_SOUTH_PA       0x03d00000u
++
++#define SE0_PA              0x00880000u
++
++#define GENI_FORCE_DEFAULT  0x20u
++#define GENI_OUTPUT_CTRL    0x24u
++#define GENI_CGC_CTRL       0x28u
++#define GENI_SER_M_CLK_CFG  0x48u
++#define GENI_FW_REV         0x68u
++#define SE_GENI_CLK_SEL     0x7Cu
++#define SE_GENI_BYTE_GRAN   0x254u
++#define SE_GENI_DMA_MODE    0x258u
++#define SE_TX_PACK0         0x260u
++#define SE_TX_PACK1         0x264u
++#define SE_I2C_TX_LEN       0x26Cu
++#define SE_I2C_RX_LEN       0x270u
++#define SE_I2C_SCL          0x278u
++#define SE_RX_PACK0         0x284u
++#define SE_RX_PACK1         0x288u
++#define SE_M_CMD0           0x600u
++#define SE_M_CMD_CTRL       0x604u
++#define SE_M_IRQ_STATUS     0x610u
++#define SE_M_IRQ_EN         0x614u
++#define SE_M_IRQ_CLEAR      0x618u
++#define SE_S_IRQ_CLEAR      0x648u
++#define SE_TX_FIFO          0x700u
++#define SE_RX_FIFO          0x780u
++#define SE_RX_FIFO_STATUS   0x804u
++#define SE_TX_WATERMARK     0x80Cu
++#define SE_RX_WATERMARK     0x810u
++#define SE_DMA_TX_IRQ_CLR   0xC44u
++#define SE_DMA_RX_IRQ_CLR   0xD44u
++#define SE_GSI_EVENT_EN     0xE18u
++#define SE_IRQ_EN           0xE1Cu
++#define SE_DMA_GENERAL_CFG  0xE30u
++
++#define M_CMD_DONE          (1u << 0)
++#define M_OVERRUN           (1u << 1)
++#define M_ILLEGAL           (1u << 2)
++#define M_FAILURE           (1u << 3)
++#define M_CANCEL            (1u << 4)
++#define M_ABORT             (1u << 5)
++#define M_GP_IRQ(n)         (1u << (9 + (n)))
++#define M_RX_WM             (1u << 26)
++#define M_RX_LAST           (1u << 27)
++#define M_TX_WM             (1u << 30)
++#define M_ERR               (M_OVERRUN | M_ILLEGAL | M_FAILURE | M_ABORT | M_GP_IRQ(0) | M_GP_IRQ(1) | M_GP_IRQ(3) | M_GP_IRQ(4))
++
++#define I2C_WRITE           1u
++#define I2C_READ            2u
++#define STOP_STRETCH        (1u << 2)
++#define GENI_SE_I2C         3u
++
++static vm_offset_t s_gcc, s_tlmm, s_se;
++static bool s_ok, s_off;
++static uint32_t s_percent = 70;
++static uint8_t s_en_reg = 0;
++
++static inline uint32_t
++rd32(vm_offset_t base, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(base + off);
++	__asm__ volatile("dmb oshld" ::: "memory");
++	return v;
++}
++
++static inline void
++wr32(vm_offset_t base, uint32_t off, uint32_t val)
++{
++	__asm__ volatile("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(base + off) = val;
++	__asm__ volatile("dsb osh" ::: "memory");
++}
++
++static int
++wait_bits(vm_offset_t base, uint32_t off, uint32_t mask, uint32_t want, uint32_t iters)
++{
++	uint32_t i;
++	for (i = 0; i < iters; ++i) {
++		if ((rd32(base, off) & mask) == want) {
++			return 0;
++		}
++	}
++	return -1;
++}
++
++static int
++ktz_xfer(uint32_t op, uint8_t addr, uint8_t *buf, uint32_t n, int stop_stretch)
++{
++	uint32_t o, b, got, st, i;
++	wr32(s_se, SE_M_IRQ_CLEAR, 0xffffffffu);
++	if (op == I2C_WRITE) {
++		wr32(s_se, SE_I2C_TX_LEN, n);
++	} else {
++		wr32(s_se, SE_I2C_RX_LEN, n);
++	}
++	wr32(s_se, SE_M_CMD0, (op << 27) | ((uint32_t)addr << 9) | (stop_stretch ? STOP_STRETCH : 0));
++	if (op == I2C_WRITE) {
++		for (o = 0; o < n; o += 4) {
++			uint32_t w = 0;
++			for (b = 0; b < 4 && o + b < n; ++b) {
++				w |= (uint32_t)buf[o + b] << (8 * b);
++			}
++			wr32(s_se, SE_TX_FIFO, w);
++		}
++	}
++	got = 0;
++	st = 0;
++	for (i = 0; i < 2000000u; ++i) {
++		st = rd32(s_se, SE_M_IRQ_STATUS);
++		if (op == I2C_READ && (st & (M_RX_WM | M_RX_LAST))) {
++			uint32_t words = rd32(s_se, SE_RX_FIFO_STATUS) & 0x1ffffffu;
++			while (words--) {
++				uint32_t w = rd32(s_se, SE_RX_FIFO);
++				for (b = 0; b < 4 && got < n; ++b) {
++					buf[got++] = (uint8_t)(w >> (8 * b));
++				}
++			}
++			wr32(s_se, SE_M_IRQ_CLEAR, st & (M_RX_WM | M_RX_LAST));
++		}
++		if (st & (M_CMD_DONE | M_ERR)) {
++			break;
++		}
++	}
++	wr32(s_se, SE_M_IRQ_CLEAR, 0xffffffffu);
++	if (!(st & (M_CMD_DONE | M_ERR))) {
++		wr32(s_se, SE_M_CMD_CTRL, 1u << 2);
++		delay(1000);
++		wr32(s_se, SE_M_IRQ_CLEAR, 0xffffffffu);
++		return -1;
++	}
++	if (st & M_GP_IRQ(1)) return -2; /* NACK */
++	if (st & M_ERR) return -3;
++	if (op == I2C_READ && got < n) return -4;
++	return 0;
++}
++
++static int
++ktz_write_reg8(uint8_t reg, uint8_t val)
++{
++	uint8_t w[2];
++	w[0] = reg;
++	w[1] = val;
++	return ktz_xfer(I2C_WRITE, KTZ_ADDR, w, 2, 0);
++}
++
++static int
++ktz_read_reg8(uint8_t reg, uint8_t *val)
++{
++	int e = ktz_xfer(I2C_WRITE, KTZ_ADDR, &reg, 1, 1);
++	if (e) return e;
++	return ktz_xfer(I2C_READ, KTZ_ADDR, val, 1, 0);
++}
++
++static uint32_t
++level_of(uint32_t pct)
++{
++	uint32_t l;
++	if (pct < 1) pct = 1;
++	if (pct > 100) pct = 100;
++	l = MAX_LEVEL * pct * pct / 10000;
++	return l < MIN_LEVEL ? MIN_LEVEL : l;
++}
++
++static uint32_t
++percent_of(uint32_t level)
++{
++	uint32_t p;
++	for (p = 1; p <= 100; ++p) {
++		if (level_of(p) >= level) return p;
++	}
++	return 100;
++}
++
++static int
++set_level(uint32_t l)
++{
++	int e;
++	if (l > MAX_LEVEL) l = MAX_LEVEL;
++	e = ktz_write_reg8(REG_BRT_LSB, (uint8_t)(l & 0x7));
++	if (!e) e = ktz_write_reg8(REG_BRT_MSB, (uint8_t)((l >> 3) & 0xff));
++	return e;
++}
++
++int
++nabu_backlight_set_percent(uint32_t pct)
++{
++	if (!s_ok) return -1;
++	if (pct < 1) pct = 1;
++	if (pct > 100) pct = 100;
++	if (!s_off && set_level(level_of(pct))) return -2;
++	s_percent = pct;
++	return (int)pct;
++}
++
++int
++nabu_backlight_get_percent(void)
++{
++	return s_ok ? (int)s_percent : -1;
++}
++
++int
++nabu_backlight_set_power(int on)
++{
++	uint32_t want;
++	int attempt;
++	if (!s_ok) return -1;
++	s_off = !on;
++	want = on ? level_of(s_percent) : 0;
++	for (attempt = 0; attempt < 3; ++attempt) {
++		int e = set_level(want);
++		uint8_t lsb = 0xff, msb = 0xff;
++		uint32_t got;
++		if (!e) e = ktz_read_reg8(REG_BRT_LSB, &lsb);
++		if (!e) e = ktz_read_reg8(REG_BRT_MSB, &msb);
++		got = ((uint32_t)msb << 3) | (lsb & 7);
++		if (!e && got == want) {
++			if (attempt) printf("NABU BL: power %d ok after %d retries\n", on, attempt);
++			return 0;
++		}
++		delay(2000);
++	}
++	return -2;
++}
++
++static int
++sysctl_backlight SYSCTL_HANDLER_ARGS
++{
++	int val = nabu_backlight_get_percent();
++	int error = sysctl_handle_int(oidp, &val, 0, req);
++	if (error || !req->newptr) {
++		return error;
++	}
++	if (val < 1) val = 1;
++	if (val > 100) val = 100;
++	nabu_backlight_set_percent((uint32_t)val);
++	return 0;
++}
++
++SYSCTL_PROC(_kern, OID_AUTO, backlight,
++    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_ANYBODY,
++    NULL, 0, sysctl_backlight, "I", "Nabu panel backlight brightness (1..100)");
++
++int
++nabu_backlight_init(void)
++{
++	int enabled = 0;
++	int boot_pct = 0;
++	uint32_t fw, level;
++	uint8_t id = 0, en = 0, lsb = 0, msb = 0;
++	int e;
++
++	(void)PE_parse_boot_argn("nabutouch", &enabled, sizeof(enabled));
++	(void)PE_parse_boot_argn("nabubacklight", &enabled, sizeof(enabled));
++	if (!enabled) {
++		return 0;
++	}
++
++	s_gcc = ml_io_map(GCC_BASE_PA, 0x60000);
++	s_tlmm = ml_io_map(TLMM_SOUTH_PA, 0x10000);
++	s_se = ml_io_map(SE0_PA, 0x4000);
++	if (!s_gcc || !s_tlmm || !s_se) {
++		printf("NABU BL: MMIO mapping failed\n");
++		return -1;
++	}
++
++	/* Turn on clocks: CXO 19.2 MHz (src 0, div 1) */
++	wr32(s_gcc, GCC_SE0_RCG + 4, (0u << 8) | 1u);
++	wr32(s_gcc, GCC_SE0_RCG, rd32(s_gcc, GCC_SE0_RCG) | 1u);
++	if (wait_bits(s_gcc, GCC_SE0_RCG, 1u, 0, 2000000u)) {
++		printf("NABU BL: RCG update timeout\n");
++		return -2;
++	}
++	wr32(s_gcc, GCC_QUP_VOTE, rd32(s_gcc, GCC_QUP_VOTE) | GCC_QUP0_M_AHB | GCC_QUP0_S_AHB | GCC_SE0_VOTE);
++	if (wait_bits(s_gcc, GCC_QUP0_M_AHB_HALT, 1u << 31, 0, 2000000u)) {
++		printf("NABU BL: M_AHB halt timeout\n");
++		return -3;
++	}
++	if (!(rd32(s_gcc, GCC_QUP0_S_AHB_HALT) & 2u) && wait_bits(s_gcc, GCC_QUP0_S_AHB_HALT, 1u << 31, 0, 2000000u)) {
++		printf("NABU BL: S_AHB halt timeout\n");
++		return -4;
++	}
++	if (wait_bits(s_gcc, GCC_SE0_HALT, 1u << 31, 0, 2000000u)) {
++		printf("NABU BL: SE0 halt timeout\n");
++		return -5;
++	}
++
++	/* Pins: GPIO 0 (SDA), GPIO 1 (SCL) -> func 1 (qup0) */
++	wr32(s_tlmm, 0x1000u * 0, 1u << 2);
++	wr32(s_tlmm, 0x1000u * 1, 1u << 2);
++
++	/* Check I2C firmware protocol */
++	fw = rd32(s_se, GENI_FW_REV);
++	if (((fw >> 8) & 0xffu) != GENI_SE_I2C) {
++		printf("NABU BL: SE0 has no I2C firmware (fw=%#x)\n", fw);
++		return -6;
++	}
++
++	/* Init GENI SE FIFO mode */
++	wr32(s_se, SE_GSI_EVENT_EN, 0);
++	wr32(s_se, SE_M_IRQ_CLEAR, 0xffffffffu);
++	wr32(s_se, SE_S_IRQ_CLEAR, 0xffffffffu);
++	wr32(s_se, SE_DMA_TX_IRQ_CLR, 0xffffffffu);
++	wr32(s_se, SE_DMA_RX_IRQ_CLR, 0xffffffffu);
++	wr32(s_se, GENI_CGC_CTRL, rd32(s_se, GENI_CGC_CTRL) | 0x7fu);
++	wr32(s_se, SE_DMA_GENERAL_CFG, rd32(s_se, SE_DMA_GENERAL_CFG) | 0xfu);
++	wr32(s_se, GENI_OUTPUT_CTRL, 0x7fu);
++	wr32(s_se, GENI_FORCE_DEFAULT, 1u);
++	wr32(s_se, SE_IRQ_EN, rd32(s_se, SE_IRQ_EN) | 0xfu);
++	wr32(s_se, SE_GENI_DMA_MODE, rd32(s_se, SE_GENI_DMA_MODE) & ~1u);
++	wr32(s_se, SE_RX_WATERMARK, 1u);
++	wr32(s_se, SE_M_IRQ_EN, rd32(s_se, SE_M_IRQ_EN) | M_CMD_DONE | M_TX_WM | M_RX_WM | M_RX_LAST | M_CANCEL | M_ERR);
++	wr32(s_se, SE_TX_PACK0, 0x7f8feu);
++	wr32(s_se, SE_TX_PACK1, 0xffefeu);
++	wr32(s_se, SE_RX_PACK0, 0x7f8feu);
++	wr32(s_se, SE_RX_PACK1, 0xffefeu);
++	wr32(s_se, SE_GENI_BYTE_GRAN, 0);
++	wr32(s_se, SE_GENI_CLK_SEL, 0);
++	wr32(s_se, GENI_SER_M_CLK_CFG, (7u << 4) | 1u);
++	wr32(s_se, SE_I2C_SCL, (10u << 20) | (11u << 10) | 26u);
++
++	/* Probe KTZ8866 */
++	e = ktz_read_reg8(REG_DEVICE_ID, &id);
++	if (!e) e = ktz_read_reg8(REG_BL_EN, &en);
++	if (!e) e = ktz_read_reg8(REG_BRT_LSB, &lsb);
++	if (!e) e = ktz_read_reg8(REG_BRT_MSB, &msb);
++	if (e) {
++		printf("NABU BL: KTZ8866 @0x11 probe failed (err=%d)\n", e);
++		return -7;
++	}
++	level = ((uint32_t)msb << 3) | (lsb & 7);
++	s_en_reg = en;
++	s_percent = percent_of(level);
++	s_ok = true;
++
++	if (PE_parse_boot_argn("backlight", &boot_pct, sizeof(boot_pct)) && boot_pct >= 1 && boot_pct <= 100) {
++		nabu_backlight_set_percent((uint32_t)boot_pct);
++	}
++
++	printf("NABU BL: KTZ8866 ready (id=%#x en=%#x level=%u/2047 pct=%u%%)\n",
++	    id, en, level, s_percent);
++	return 0;
++}
++#endif /* ARM64_BOARD_CONFIG_NABU */

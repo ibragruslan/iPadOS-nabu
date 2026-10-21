@@ -1,0 +1,77 @@
+--- a/bsd/dev/nabu_touch.c
++++ b/bsd/dev/nabu_touch.c
+@@ -331,9 +331,23 @@
+ {
+ 	uint8_t frame[NVT_POINT_DATA_LEN];
+ 	struct nvt_contact contacts[NVT_MAX_FINGERS];
+-	unsigned good = 0, bad = 0;
++	unsigned good = 0, bad = 0, reported = 0;
++	bool down[NVT_MAX_FINGERS + 1];
++
++	bzero(down, sizeof(down));
+ 
+-	for (unsigned i = 0; i < 100; i++) {
++	/*
++	 * This used to be a 100-frame probe that only printed what it saw, so
++	 * the panel was read correctly but iOS never heard about it. Run it as
++	 * a real driver instead: hand every contact to the HID service
++	 * (NabuHIDTouch -> backboardd, the same path the buttons already use)
++	 * and synthesise a release for any finger that drops out of a frame,
++	 * otherwise UIKit would keep the touch down forever.
++	 *
++	 * Logging has to stay quiet here: at 100 Hz the old per-point printf
++	 * would bury the console and the log ring.
++	 */
++	for (;;) {
+ 		int n = -1;
+ 		if (nvt_read_point_frame(&ts.bus, frame) == 0) {
+ 			n = nvt_parse_points(frame, 1600, 2560, contacts,
+@@ -343,24 +357,37 @@
+ 				bad = 0;
+ 			}
+ 			good++;
+-			if (n > 0) {
+-				printf("NABU TOUCH: frame %u contacts=%d f0=%02x %02x %02x %02x %02x %02x\n",
+-				    i, n, frame[0], frame[1], frame[2], frame[3],
+-				    frame[4], frame[5]);
+-				for (int k = 0; k < n; k++) {
+-					printf("NABU TOUCH: point id=%d x=%d y=%d p=%d\n",
+-					    contacts[k].id, contacts[k].x, contacts[k].y,
+-					    contacts[k].pressure);
++			bool seen[NVT_MAX_FINGERS + 1];
++			bzero(seen, sizeof(seen));
++			for (int k = 0; k < n; k++) {
++				int id = contacts[k].id;
++				if (id < 1 || id > NVT_MAX_FINGERS) {
++					continue;
+ 				}
++				seen[id] = true;
++				down[id] = contacts[k].down != 0;
++				nabu_hid_touch(id - 1, contacts[k].down,
++				    contacts[k].x, contacts[k].y);
++				if (reported < 8) {
++					reported++;
++					printf("NABU TOUCH: hid id=%d down=%d x=%d y=%d\n",
++					    id, contacts[k].down, contacts[k].x,
++					    contacts[k].y);
++				}
+ 			}
++			for (int id = 1; id <= NVT_MAX_FINGERS; id++) {
++				if (down[id] && !seen[id]) {
++					down[id] = false;
++					nabu_hid_touch(id - 1, 0, 0, 0);
++				}
++			}
+ 		} else {
+ 			if (bad++ == 0) {
+-				printf("NABU TOUCH: point read failed at frame %u\n", i);
++				printf("NABU TOUCH: point read failed (frame %u)\n", good);
+ 			}
+ 		}
+-		delay(20000);
++		delay(10000);
+ 	}
+-	printf("NABU TOUCH: polling done good=%u bad=%u\n", good, bad);
+ }
+ 
+ static void
