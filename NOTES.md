@@ -93,6 +93,41 @@ and verified with `patch -p1 --dry-run`.
   sets `MACHINE_FLAGS_ARM64_NABU = -DARM64_BOARD_CONFIG_NABU` for the whole
   build.
 
+**RESULT of booting 0087 (2026-10-22 ~01:45): the disk log STILL stops at
+flush #1 (7708 bytes), and crucially there is NO `retry` / `write failed`
+line - so the flush loop is NOT hitting the error path 0085 fixes.** The
+remaining explanation is that the thread never returns from a flush:
+`ufs_write_blocks()` most likely blocks forever (polled UFS) or the thread
+starves on `nabu_ufs_lock` once launchd drives real root I/O. 0085 is still
+correct and worth keeping, but it is not sufficient. NEXT IDEA: give the log
+flush its own bounce buffer instead of sharing `su.dma + DMA_BOUNCE`, and/or
+bound the wait in `ufs_write_blocks` so a stuck flush cannot wedge the thread.
+
+**BIG find: `tools/nabu-log-pull.sh` TRUNCATES the log.** It trusts the
+header's `total`, so when the header is stale (flush #1) everything already
+on the disk beyond those bytes is thrown away. Dump the ring directly
+instead:
+`dd if=LOG.bin bs=4096 skip=1 | strings -n 4 > ring-full.txt`
+That recovered 38693 lines (`logs/ring-full.txt`) from the ring on 10-22.
+Worth fixing the tool to fall back to a full-ring dump.
+
+**What that recovered log shows (NOTE: it is the last long boot BEFORE the
+iPad7,3 pivot - surfaces are 1125x2436 = iPhone X, prefixes still "SWEET",
+but it already contains the 0083 NT36523 probe, so it is from 10-21):**
+- `exec SpringBoard` and `exec backboardd` both happen; backboardd opens
+  AppleCLCD (`-> 0x0`) and runs IOMFB sels 57, 15, 22, 29, 33, 79, 74.
+- backboardd creates double-buffered surfaces 1125x2436 BGRA and then does
+  **only 4 swaps** (`SWEET FB: swap 1..4`) - then nothing more.
+- SpringBoard is alive and rendering: creates icon surfaces (272x184,
+  312x202, 230x186), logs CATransformLayer property warnings, initialises
+  VoiceTrigger. So the GUI stack runs; it just stops presenting.
+- No GPU at all: `IOAcceleratorES` x17, `IOAcceleratorESLegacy` x16,
+  `AGXAccelerator` x2 -> none. Also missing `/backlight`,
+  `aop-smart-cover`, `pearl-sep` (Face ID).
+- Crashes seen: `driverkitd` sig 9, `mobileactivation` sig 5 (repeatedly).
+- Tail of the ring is the NT36523 touch probe spamming an identical raw
+  frame `fc f1 95 2d a0 19 58 12` over and over.
+
 **NEXT (frontier on the new base):** get backboardd + SpringBoard up and
 rendering to the 1600x2560 framebuffer (prior base got there; re-derive here).
 To diagnose where SpringBoard is, pull a fresh console log (recovery pull or
