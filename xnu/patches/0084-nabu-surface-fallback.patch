@@ -1,0 +1,60 @@
+diff --git a/iokit/Kernel/arm/NabuSurface.cpp b/iokit/Kernel/arm/NabuSurface.cpp
+--- a/iokit/Kernel/arm/NabuSurface.cpp
++++ b/iokit/Kernel/arm/NabuSurface.cpp
+@@ -70,6 +70,7 @@ enum {
+ static IOLock       *nabu_surface_lock;
+ static NabuSurface *nabu_surface_table[NABU_SURFACE_MAX_ID];
+ static uint32_t      nabu_surface_users[NABU_SURFACE_MAX_ID];
++static uint32_t      nabu_surface_bgra_id = 0;
+ static uint32_t      nabu_surface_next_id = 1;
+ static uint32_t      nabu_surface_creates_logged;
+ static uint64_t      nabu_surface_wired;       /* bytes of buffer surfaces */
+@@ -220,10 +221,36 @@ nabu_surface_publish(NabuSurface *s)
+ 	bool ok;
+ 	IOLockLock(nabu_surface_lock);
+ 	ok = nabu_surface_insert_locked(s);
++	if (ok && s->pixelFormat == 0x42475241) {
++		nabu_surface_bgra_id = s->id;
++	}
+ 	IOLockUnlock(nabu_surface_lock);
+ 	return ok;
+ }
+ 
++void
++nabu_surface_probe_all(void)
++{
++	IOLockLock(nabu_surface_lock);
++	for (uint32_t i = 1; i < NABU_SURFACE_MAX_ID; i++) {
++		NabuSurface *s = nabu_surface_table[i];
++		if (s != NULL && s->pixelFormat == 0x42475241) {
++			nabu_surface_bgra_id = s->id;
++			IOLog("NABU SURF PROBE: found BGRA surface id %u %ux%u\n", s->id, s->width, s->height);
++		}
++	}
++	IOLockUnlock(nabu_surface_lock);
++}
++
++uint32_t
++nabu_surface_bgra_hint_id(void)
++{
++	if (nabu_surface_bgra_id == 0) {
++		nabu_surface_probe_all();
++	}
++	return nabu_surface_bgra_id;
++}
++
+ NabuSurface *
+ nabu_surface_create_physical(uint64_t phys, uint32_t width, uint32_t height,
+     uint32_t bytesPerRow, uint32_t pixelFormat)
+diff --git a/iokit/Kernel/arm/NabuSurface.h b/iokit/Kernel/arm/NabuSurface.h
+--- a/iokit/Kernel/arm/NabuSurface.h
++++ b/iokit/Kernel/arm/NabuSurface.h
+@@ -61,5 +61,8 @@ NabuSurface *nabu_surface_create_physical(uint64_t phys, uint32_t width,
+ /* Send right for the surface in task (IOSurfaceLookupFromMachPort). */
+ mach_port_name_t nabu_surface_port_in_task(NabuSurface *surface, task_t task);
+ 
++void nabu_surface_probe_all(void);
++uint32_t nabu_surface_bgra_hint_id(void);
++
+ #endif /* NABU */
+ #endif /* _NABU_SURFACE_H */
