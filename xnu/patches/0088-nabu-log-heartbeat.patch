@@ -1,0 +1,23 @@
+--- a/bsd/dev/nabu_ufs.c
++++ b/bsd/dev/nabu_ufs.c
+@@ -749,6 +749,20 @@
+ 	for (;;) {
+ 		(void)tsleep(&nabu_log_chan, PZERO, "nabulog", hz * (int)nabu_log_secs);
+ 		uint64_t total = os_atomic_load(&nabu_log_total, relaxed);
++		/*
++		 * Heartbeat. Two jobs:
++		 *  - it is printed, so the framebuffer console shows whether the
++		 *    ring is still growing (total) and how far the disk copy got
++		 *    (flushed/seq) - the console keeps running long after the
++		 *    on-disk log stops, and that asymmetry is the bug we are
++		 *    chasing;
++		 *  - printing feeds nabu_log_append() itself, so the ring always
++		 *    grows, a flush is always due, and the on-disk header can no
++		 *    longer stay stuck at flush #1 while data blocks move on
++		 *    (which made nabu-log-pull.sh truncate the whole log).
++		 */
++		printf("NABU LOG: tick total=%llu flushed=%llu seq=%llu\n",
++		    total, flushed, seq);
+ 		if (total == flushed) {
+ 			continue;
+ 		}
